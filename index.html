@@ -1151,7 +1151,12 @@ const BLOCK_REASONS = [
   [0x08, 'Refraktärzeit'],
   [0x10, 'Kurvenlaufen'],
   [0x20, 'Ausreißer-Schritt'],
-  [0x40, 'Schwankung Kontaktwinkel'],
+  // Heisst in der Firmware weiter SUPPRESS_VARIATION_FLEX und behaelt seinen
+  // Wert 0x40 — geprueft wird damit aber seit dem 2026-09-25 der Flex-UMFANG
+  // (max - min ueber die Schwungphase), nicht die Spitze und erst recht kein
+  // Kontaktwinkel. Der Protokollname ist bewusst eingefroren
+  // (src/gait/marker.h), die Beschriftung hier war dadurch schlicht falsch.
+  [0x40, 'Schwankung Flex-Umfang'],
 ];
 
 // "HS10 A10 N4 T1 B085" — 19 chars, fixed-offset ASCII, see src/comms/ble.h.
