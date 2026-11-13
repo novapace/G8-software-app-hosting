@@ -1090,7 +1090,7 @@ async function hydrate(clip) {
     // has just gone false and the whole run falls back to one write per
     // beat — the "GX" is what stops the other clip's own timer, which would
     // otherwise cue on top of those writes.
-    if (clipTimedBeat()) { await probeLag(clip); await armClipBeat(clip, false); }
+    if (clipTimedBeat()) { await probeLag(clip); await armClipBeat(clip, false); await settleBeat(clip); }
     else await broadcast('GX');
   }
 }
@@ -1490,8 +1490,8 @@ const BEAT_LEAD_MS = 600;
 
 // The start is the run's ONLY hard phase set, and the phase it leaves
 // behind is only as good as its own frame's trip: everything after it moves
-// 25 ms at a time, so a start that lands 300 ms out stays visibly out for a
-// minute or two. So the start frame is repeated until one of them was
+// at most 25 ms per 8 s window, so a start that lands 300 ms out stays
+// visibly out for a minute or two. So the start frame is repeated until one of them was
 // itself a fast trip — at most BEAT_START_TRIES times, since a link that
 // slow will not be cueing anyone well either way.
 const BEAT_START_RETRY_MS = 40;
@@ -1501,13 +1501,18 @@ const BEAT_START_TRIES    = 4;
 //
 // Their clocks are not this one and not each other's, and the error that
 // matters is between the two FEET: once they are half a beat apart they
-// have swapped. The firmware applies only half of each reported error and
-// caps a correction at 25 ms, so the interval is what sets how much clock
-// error the loop can actually track — 25 ms per 4 s is ~6000 ppm, against
-// the ≤250 ppm the beat's clock source is good for. Two 6-byte writes every
-// four seconds is still less traffic than the one-write-per-beat design
-// this replaced.
-const BEAT_RESYNC_MS = 4000;
+// have swapped. Each "GS" is only a REPORT: it arrives late by its own trip
+// through the link, never early, so the firmware collects eight of them,
+// believes the one with the smallest error — the fastest trip — and applies
+// a single correction of at most 10 ms (unlimited for the first windows
+// after a start, see settleBeat()). See RHYTHM_SYNC_* in src/config.h.
+//
+// It used to be one report every 4 s, each acted on at once and by up to
+// 25 ms. That moved the beat by the link's jitter rather than by the drift,
+// each foot on its own, and was what made the rhythm feel uneven. One a
+// second gives the filter a window of 8 s; two 6-byte writes per second is
+// still nothing next to the 60 ms status frames coming the other way.
+const BEAT_RESYNC_MS = 1000;
 
 // Tell one clip when its next beat is due, as a delay from now.
 //
@@ -1532,16 +1537,22 @@ function beatFrame(clip, sync) {
   if (k < 0) k = 0;
   // Even slots are left, odd are right.
   if (k % 2 !== (clip.side === 'R' ? 1 : 0)) k++;
-  // Take the frame's own trip out of the number. Without this the clip is
-  // told "beat in n ms" and starts counting n ms LATE by exactly the
-  // latency — a one-directional bias, so the sync would faithfully hold the
-  // clip at it instead of correcting it away.
-  const delay = Math.min(9999, Math.max(0, Math.round(state.anchor + k * iv - now - own - (clip.lagMs || 0))));
+  // The frame's own trip is deliberately NOT taken out of the number. It
+  // used to be (minus clip.lagMs, half a measured round trip), and that was
+  // the remaining source of jumps, recorded on hardware 2026-11-13: the
+  // estimate is per clip and moves with the phone's load, so it shifted the
+  // two feet against each other by up to 100 ms. Left alone, every report
+  // is late by its trip and NEVER early — exactly the one-sided error the
+  // firmware's minimum filter removes. What stays is the fastest trip, a
+  // few ms and the same for both feet, so it does not show between them.
+  const delay = Math.min(9999, Math.max(0, Math.round(state.anchor + k * iv - now - own)));
   return (sync ? 'GS' : 'G') + String(delay).padStart(4, '0');
 }
 
 async function armClipBeat(clip, sync) {
-  if (sync) return timedWrite(clip, beatFrame(clip, true));
+  // Sync reports go out unacknowledged: nothing waits for the answer, and
+  // an acknowledged write holds the device's GATT queue for a round trip.
+  if (sync) return sendCmd(clip, beatFrame(clip, true));
   // Hard set, repeated until one of the frames was itself a fast trip. Each
   // is recomputed from the anchor, so a retry simply names whatever slot is
   // still far enough out — and lands on the same grid as the other foot.
@@ -1601,6 +1612,25 @@ async function armBeat(fresh) {
     state.timer = setTimeout(rhythmTick, BEAT_LEAD_MS);
   }
   await Promise.all(state.clips.map(c => armClipBeat(c, false)));
+  await Promise.all(state.clips.map(settleBeat));
+}
+
+// Straight after a hard start: four windows of sync reports in quick
+// succession. The start frame is a single trip, sent while this page is at
+// its busiest, and recorded on hardware it left a foot 90 ms to several
+// hundred ms off — felt as a limp, or as both feet buzzing together. The
+// firmware takes the whole error out during its first windows after a start
+// (RHYTHM_SYNC_ACQUIRE_WINDOWS in src/config.h); this burst gets it through
+// them in about three seconds instead of half a minute.
+const BEAT_SETTLE_FRAMES = 32;  // = RHYTHM_SYNC_WINDOW × RHYTHM_SYNC_ACQUIRE_WINDOWS
+async function settleBeat(clip) {
+  for (let i = 0; i < BEAT_SETTLE_FRAMES; i++) {
+    if (!state.rhythmOn) return;
+    await armClipBeat(clip, true);
+    // Spaced out so the reports ride different connection events — eight in
+    // one event would share one trip time and filter nothing.
+    await new Promise(r => setTimeout(r, 80));
+  }
 }
 
 // The drift correction. Deliberately driven by its own interval rather than
