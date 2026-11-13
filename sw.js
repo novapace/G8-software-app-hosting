@@ -12,7 +12,7 @@
 // nie, und ein bereits installiertes Telefon bleibt auf seiner alten Fassung
 // stehen. Aus dem Inhalt abgeleitet kann das nicht mehr passieren, und ein
 // Bauen ohne Änderung erzeugt denselben Namen, wirft also auch nichts weg.
-const CACHE = 'novapace-clip-3bf43644ded6';
+const CACHE = 'novapace-clip-3a4a3488e212';
 
 const ASSETS = [
   './',
