@@ -948,10 +948,22 @@ function wireCalendar() {
 // `droppable` is for the phase-sync reports: they carry a time, a queued one
 // is stale by however long it waited, and the next one is a second away. If
 // anything is pending they are skipped rather than queued.
+//
+// Resolves to true when the write went out, false when it did not (no
+// characteristic, skipped, rejected, timed out). Most callers can ignore it;
+// the rhythm start must not: a rejected "G" used to look like a fast trip and
+// was never retried, and that clip kept the old tempo.
+//
+// `ack` uses writeValueWithResponse(), NOT writeValue(). writeValue() leaves
+// the write type to the platform, and on Android a characteristic that also
+// advertises WriteWithoutResponse defaults to exactly that - so the
+// "acknowledged" write was not acknowledged, its promise said nothing about
+// the clip, and a frame the clip dropped (ArduinoBLE discards incoming
+// packets when its receive buffer is full) vanished without a timeout.
 const WRITE_TIMEOUT_MS = 3000;
 function sendCmd(clip, cmd, ack, droppable) {
-  if (!clip?.ctrlChar) return Promise.resolve();
-  if (droppable && clip.writesPending) return Promise.resolve();
+  if (!clip?.ctrlChar) return Promise.resolve(false);
+  if (droppable && clip.writesPending) return Promise.resolve(false);
   const data = new TextEncoder().encode(cmd);
   clip.writesPending = (clip.writesPending || 0) + 1;
   const run = (clip.writeChain || Promise.resolve()).then(async () => {
@@ -963,19 +975,22 @@ function sendCmd(clip, cmd, ack, droppable) {
     // which is the one stop that needs no write to arrive.
     let timer;
     try {
-      if (!clip.ctrlChar) return;
-      const write = (!ack && clip.ctrlChar.properties.writeWithoutResponse)
-        ? clip.ctrlChar.writeValueWithoutResponse(data)
-        : clip.ctrlChar.writeValue(data);
+      if (!clip.ctrlChar) return false;
+      const ch = clip.ctrlChar;
+      const write = (!ack && ch.properties.writeWithoutResponse)
+        ? ch.writeValueWithoutResponse(data)
+        : (ch.writeValueWithResponse ? ch.writeValueWithResponse(data) : ch.writeValue(data));
       const timeout = new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('write timeout')), WRITE_TIMEOUT_MS);
       });
       await Promise.race([write, timeout]);
+      return true;
     } catch (e) {
       console.warn('[ble write]', clip.side, cmd, e.message);
       if (e.message === 'write timeout') {
         try { clip.device.gatt.disconnect(); } catch (_) {}
       }
+      return false;
     } finally {
       clearTimeout(timer);
       clip.writesPending--;
@@ -1592,9 +1607,13 @@ async function armClipBeat(clip, sync) {
   // Hard set, repeated until one of the frames was itself a fast trip. Each
   // is recomputed from the anchor, so a retry simply names whatever slot is
   // still far enough out — and lands on the same grid as the other foot.
+  //
+  // A FAILED write is retried too. It used to fall through as a success: the
+  // rejection comes back fast, so its "trip" looked short and the loop
+  // stopped - with the clip never told, still beating on the old tempo.
   for (let i = 0; i < BEAT_START_TRIES; i++) {
     const half = await timedWrite(clip, beatFrame(clip, false));
-    if (half - (clip.lagMs || 0) <= BEAT_START_RETRY_MS) return;
+    if (half != null && half - (clip.lagMs || 0) <= BEAT_START_RETRY_MS) return;
   }
 }
 
@@ -1608,9 +1627,12 @@ async function armClipBeat(clip, sync) {
 // the filter every clock-sync protocol uses, and the reason an occasional
 // 300 ms outlier does not drag the estimate with it. The slow leak lets it
 // climb again if the link really has become slower.
+//
+// Returns null when the write failed: a rejection is no trip at all, and
+// timing it would both fake a fast sample and drag the estimate down.
 async function timedWrite(clip, cmd) {
   const t0 = performance.now();
-  await sendCmd(clip, cmd, true);
+  if (!await sendCmd(clip, cmd, true)) return null;
   const half = (performance.now() - t0) / 2;
   clip.lagMs = clip.lagMs == null ? half : Math.min(half, clip.lagMs * 1.05 + 1);
   return half;
@@ -1622,10 +1644,16 @@ async function timedWrite(clip, cmd) {
 // a single late packet still has lasting consequences. "B" is idempotent
 // and already part of the protocol, so it doubles as the probe; twice,
 // because a single sample could itself be the outlier.
+//
+// It is also what gets the new tempo onto the clip before the "G" (the
+// broadcast "B" in pushBpm() goes out unacknowledged), so a failed probe is
+// repeated: two good samples, at most BEAT_START_TRIES attempts.
 async function probeLag(clip) {
   const cmd = 'B' + String(state.bpm).padStart(3, '0');
-  await timedWrite(clip, cmd);
-  await timedWrite(clip, cmd);
+  let ok = 0;
+  for (let i = 0; i < BEAT_START_TRIES && ok < 2; i++) {
+    if (await timedWrite(clip, cmd) != null) ok++;
+  }
 }
 
 // (Re-)start the clips' own beat against the current anchor. No-op on the
